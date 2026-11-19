@@ -7,13 +7,13 @@ description: One line on what the talk covers.
 
 # Common Evals
 
-*techinical presentation*
+*techinical presentation*, engineers and research folks
 
 - [https://github.com/oneprojectorg/common-evals](https://github.com/oneprojectorg/common-evals)
 
 - [https://oneprojectorg.github.io/technical-presentations/evals/introduction.html](https://oneprojectorg.github.io/technical-presentations/evals/introduction.html)
 
-This is a promptfoo based llm eval tool chain designed to test its
+This is a [promptfoo](https://www.promptfoo.dev/) based llm eval tool chain designed to test its
 ability to work with decision information.
 
 - Its unscientific, need input
@@ -21,6 +21,7 @@ ability to work with decision information.
 - To run requires an interfence engine (Together AI or Anthropic) and Homebrew
 - Linux users can use [linuxbrew](https://docs.brew.sh/Homebrew-on-Linux)
   - willing to help anyone set this up
+- PromptFoo is a low code setup
 
 # Setup
 
