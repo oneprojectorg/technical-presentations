@@ -2,59 +2,42 @@
 title: Introduction to Common Evals
 author: Ivan Willig
 date: 2026-11-19
-# One line on what the talk covers. It is the row this deck gets in the talks
-# table on the site's index page, so write it for somebody deciding whether to
-# read on.
 description: One line on what the talk covers.
 ---
 
-<!-- This file was rendered from templates/presentation.md by `just new`, which
-     filled in the front matter above. Fix anything it guessed wrong, starting
-     with the description.
+# Common Evals
 
-     Build it:  just build-presentation evals/introduction.md
-     One `#` heading starts a slide. Keep a slide to one point — if it needs
-     scrolling, it is two slides. Delete the slides you do not use; this is an
-     arc, not a form. -->
+*techinical presentation*
 
-# The problem
+[https://github.com/oneprojectorg/common-evals](https://github.com/oneprojectorg/common-evals)
 
-<!-- Open on the problem the room already has, not on what you built. If they
-     do not recognise the problem, nothing after this slide lands. -->
+This is a promptfoo based llm eval tool chain designed to test its
+ability to work with decision information.
 
-# Introduction to Common Evals {.dark}
+- Its unscientific, need input
+- still early, "but can run the full path"
+- To run requires a Together AI or Anthropic and Homebrew
+- Linux users can use [linuxbrew](https://docs.brew.sh/Homebrew-on-Linux)
+  - willing to help anyone set this up
 
-<!-- A dark slide marks the break between parts of a talk. Use it to move from
-     the problem to your answer, and again before what you want from them. -->
+# Setup
 
-# What it is
+1. Install [homebrew](https://brew.sh/)
+1. Project Setup
+   - Two sub projects,
+     - prompt foo system for different model, comparision martix
+     - `data` download just project
+     - both should have readme.md
+     - feedback welcome!
+1. `git checkout git@github.com:oneprojectorg/common-evals.git`
+1. Run brew bundle in both (projects) Sorry
+   1. brew bundle install
+   1. cd data; brew bundle install
+1. Export interfence engine api key.
+1. Run Just command for model eval
+   1. `just --list`
 
-<!-- One sentence a listener could repeat to a colleague tomorrow. -->
+# Demo
 
-# How it works
-
-<!-- Replace this comment with a diagram:
-     ```plantuml
-     @startuml
-     ...
-     @enduml
-     ```
-     filters/diagram.lua renders it to an SVG embedded in the built deck. -->
-
-# What it costs
-
-|  | Needs |
-|---|---|
-| Hardware |  |
-| Tooling |  |
-
-# What to do next
-
-<!-- End on the one action you want from the room, not on a summary. -->
-
-::: handout
-Speaker notes: hidden on screen, printed with the handout. Write the sentence
-you will forget under pressure, not the slide you can already see. Use
-`::: handout`, not `::: notes` — the slidy writer drops a notes block and the
-text never reaches the page.
-:::
+1. glm-5.3-flash, fast and check for demo.
+1. Lets use `cambridge-pb`
