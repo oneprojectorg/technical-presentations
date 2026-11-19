@@ -9,8 +9,9 @@ description: One line on what the talk covers.
 
 *techinical presentation*
 
-[https://github.com/oneprojectorg/common-evals](https://github.com/oneprojectorg/common-evals)
-[https://oneprojectorg.github.io/technical-presentations/evals/introduction.html](https://oneprojectorg.github.io/technical-presentations/evals/introduction.html)
+- [https://github.com/oneprojectorg/common-evals](https://github.com/oneprojectorg/common-evals)
+
+- [https://oneprojectorg.github.io/technical-presentations/evals/introduction.html](https://oneprojectorg.github.io/technical-presentations/evals/introduction.html)
 
 This is a promptfoo based llm eval tool chain designed to test its
 ability to work with decision information.
