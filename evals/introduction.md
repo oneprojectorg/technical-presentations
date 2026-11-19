@@ -16,12 +16,14 @@ description: One line on what the talk covers.
 This is a [promptfoo](https://www.promptfoo.dev/) based llm eval tool chain designed to test its
 ability to work with decision information.
 
-- Its unscientific, need input
-- still early, "but can run the full path"
-- To run requires an interfence engine (Together AI or Anthropic) and Homebrew
+- [common-eval] unscientific, need input from domain experts
+- Still early, "but can run the full path"
+- Requires an interfence engine (Together AI or Anthropic, local) and Homebrew
 - Linux users can use [linuxbrew](https://docs.brew.sh/Homebrew-on-Linux)
-  - willing to help anyone set this up
-- PromptFoo is a low code setup
+  - Willing to help anyone set this up
+- [PromptFoo](https://www.promptfoo.dev/) is a low code setup
+- PromptFoo uses [Yaml], supports other systems, like json
+  - Likes yaml because is natively supports comments. can revist
 
 # Setup
 
@@ -33,18 +35,19 @@ ability to work with decision information.
      - both should have readme.md
      - feedback welcome!
 1. `git clone git@github.com:oneprojectorg/common-evals.git`
-1. Top
+
+# Demo
+
+1. glm-5.3-flash, fast and check for demo.
+1. Export interfence engine api key.
+1. Lets use `cambridge-pb`
+1. Install
    1. `brew bundle install`
    1. `just --list`
    1. `cd data`
    1. `just download cambridge-pb`
    1. `just build-cases --per-label 3 --seed 7 cambridge-classification`
    1. `just eval-generated`
-1. Export interfence engine api key.
+
 1. Run Just command for model eval
    1. `just --list`
-
-# Demo
-
-1. glm-5.3-flash, fast and check for demo.
-1. Lets use `cambridge-pb`
