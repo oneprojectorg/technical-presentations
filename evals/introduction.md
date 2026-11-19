@@ -51,5 +51,5 @@ ability to work with decision information.
    1. `just download cambridge-pb`
    1. `just build-cases --per-label 3 --seed 7 cambridge-classification`
    1. `just eval-generated`
-1. Run Just command for model eval
+   1. `just grader=huggingface:chat:zai-org/GLM-5.3 eval-generated hf-glm-5.3 hf-glm-5.3-flash hf-qwen-27b`
    1. `just --list`
