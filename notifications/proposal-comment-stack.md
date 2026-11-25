@@ -288,7 +288,260 @@ activity snapshot. Opening the row stamps `read_at` and `seen_at`.
 :::
 :::
 
-Live on the local stack; the bell ships in [#2713](https://github.com/oneprojectorg/common/pull/2713), behind the `in_app_notifications` feature flag.
+Live on the local stack; the bell ships in
+[#2713](https://github.com/oneprojectorg/common/pull/2713), behind the
+`in_app_notifications` feature flag.
+
+# How does this scale?
+
+Valentino's four cases:
+
+- Alice merged proposal A into proposal B
+- Bob requested a revision on his review of proposal A
+- Alice replied by updating proposal A
+- Alice submitted custom form X
+
+# One decision per field: does a feed query by it?
+
+The shipped write, `recordProposalCommentActivity.ts` in [#2708](https://github.com/oneprojectorg/common/pull/2708), split by that decision:
+
+::: columns
+::: column
+
+**Yes** — a feed filters activities by it. It becomes a real,
+object-specific FK column with a `(scope, created_at desc, id desc)`
+index:
+
+```ts
+await db
+  .insert(activities)
+  .values({
+    outboxId,
+    eventName: Events
+      .proposalCommentPosted.name,
+    // process feed queries by it
+    processInstanceId:
+      proposal.processInstanceId,
+    // proposal page queries by it
+    proposalId,
+    // comment thread queries by it
+    postId,
+    // "everything Alice did"
+    actorProfileId: authorProfileId,
+    snapshot,
+  })
+```
+
+:::
+::: column
+
+**No** — it only renders the row. It is copied into the snapshot at
+write time:
+
+```ts
+const snapshot = {
+  commenterName:
+    context.commenterName,
+  proposalTitle,
+  processName: context.processName,
+  decisionSlug: context.decisionSlug,
+  // an id, but no feed reads
+  // by it: snapshot, not FK
+  proposalProfileId:
+    context.proposalProfileId,
+  commentExcerpt:
+    context.commentContent
+      .slice(0, EXCERPT_LENGTH),
+};
+```
+
+:::
+:::
+
+The query access cases drive the schema — a new feed is what earns a
+new FK column. The snapshot exists so rendering never touches the
+domain tables: the row still reads right after the proposal is
+renamed, and after the commenter leaves (`set null`).
+
+# The four cases fit the same columns
+
+::: columns
+::: column
+
+Three of the verbs already exist — [`services/events/src/types.ts`](https://github.com/oneprojectorg/common/blob/dev/services/events/src/types.ts):
+
+```ts
+proposalMerged: {
+  name: 'proposal/merged',
+  schema: z.object({
+    relationshipId:
+      z.string().uuid(),
+    actorAuthUserId:
+      z.string().uuid(),
+  }),
+},
+reviewRevisionRequested: {
+  name: 'review/revision-requested',
+  schema: z.object({
+    assignmentId: z.string().uuid(),
+    revisionRequestId:
+      z.string().uuid(),
+  }),
+},
+reviewProposalRevisionSubmitted: {
+  name: 'review/' +
+    'proposal-revision-submitted',
+  schema: z.object({
+    proposalId: z.string().uuid(),
+    proposalHistoryId:
+      z.string().uuid(),
+    revisionRequestIds: z.array(
+      z.string().uuid()).min(1),
+  }),
+},
+```
+
+:::
+::: column
+
+```plantuml
+@startuml
+left to right direction
+rectangle "org feed" as OF
+rectangle "process feed" as PF
+rectangle "proposal page" as PR
+rectangle "comment thread" as PO
+database "activities" as A
+rectangle "organizations" as O
+rectangle "process_instances" as PI
+rectangle "proposals" as P
+rectangle "posts" as PS
+OF --> A : organization_id = $1
+PF --> A : process_instance_id = $1
+PR --> A : proposal_id = $1
+PO --> A : post_id = $1
+A --> O : FK, cascade
+A --> PI : FK, cascade
+A --> P : FK, cascade
+A --> PS : FK, cascade
+@enduml
+```
+
+Each query-by column is a direct FK to its table.
+
+Where each case lands when its consumer moves onto the model, like the comment one did:
+
+| Case | Scopes | In `snapshot` |
+| --- | --- | --- |
+| merged A into B | `proposal_id` | relationship, titles |
+| revision requested | `proposal_id` | assignment, request |
+| revision submitted | `proposal_id` | history, request ids |
+| form X submitted | `organization_id` | no event yet |
+
+:::
+:::
+
+No case adds a column: nothing queries activities by review, merge edge, or form. An object that needs that query gets a direct FK column and its index.
+
+# The actor / verb / object option
+
+::: columns
+::: column
+
+Activity streams as columns — an option, not what we built:
+
+```sql
+actor_id    uuid,
+verb        text,
+object_type text,
+object_id   uuid,  -- no FK
+target_type text,
+target_id   uuid   -- no FK
+```
+
+:::
+::: column
+
+What shipped in [#2706](https://github.com/oneprojectorg/common/pull/2706), `activities.sql.ts`:
+
+```ts
+eventName: varchar(),  // verb
+actorProfileId: uuid() // actor
+  .references(() => profiles.id,
+    { onDelete: 'set null' }),
+proposalId: uuid()     // object
+  .references(() => proposals.id,
+    { onDelete: 'cascade' }),
+snapshot: jsonb().notNull(),
+```
+
+:::
+:::
+
+The stream vocabulary is in the shipped table: `event_name` is the verb, `actor_profile_id` the actor, the scope ids and `snapshot` the object. The typed columns say what a `(type, id)` pair cannot: a deleted proposal cascades its rows; a departed actor leaves other people's feeds (`set null`).
+
+# The trade: pay at write time, read simply
+
+No feed read ships yet; these are the shapes the two schemas force.
+
+::: columns
+::: column
+
+Proposal A's feed on the shipped columns — one predicate, one index:
+
+```sql
+select a.snapshot, a.created_at
+from activities a
+where a.proposal_id = $1
+order by a.created_at desc,
+         a.id desc
+limit 20;
+```
+
+When a read needs the live object, the join is typed:
+
+```sql
+join proposals p
+  on p.id = a.proposal_id
+-- a deleted proposal already
+-- cascaded its rows away
+```
+
+:::
+::: column
+
+The same read on `(type, id)` — the option:
+
+```sql
+select a.snapshot, a.created_at
+from activities a
+where a.object_type = 'proposal'
+  and a.object_id = $1
+-- + a partial index per type
+order by a.created_at desc,
+         a.id desc
+limit 20;
+```
+
+```sql
+-- one join per type, every read
+left join proposals p
+  on a.object_type = 'proposal'
+ and p.id = a.object_id
+left join posts po
+  on a.object_type = 'post'
+ and po.id = a.object_id
+where p.id is not null
+   or po.id is not null
+-- orphans of deleted objects,
+-- filtered here, forever
+```
+
+:::
+:::
+
+The shipped shape pays once, at write time: a column, an FK, an index, a migration per queryable object, and the consumer fills the scopes. The `(type, id)` shape inverts the trade: free writes, and every read carries the type dispatch, the per-type joins, and the orphan filtering.
+
 
 # Appendix
 
@@ -314,6 +567,7 @@ Schema PR: [#2706](https://github.com/oneprojectorg/common/pull/2706) — merges
 
 A replayed event changes nothing. Delivery is at least once; storage
 dedupes every step.
+
 
 # The pull requests
 
