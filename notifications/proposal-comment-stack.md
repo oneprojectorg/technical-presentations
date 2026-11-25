@@ -21,7 +21,7 @@ The unread badge:
 ```sql
 select count(*)
 from notifications
-where user_id = $1
+where auth_user_id = $1
   and read_at is null;
 ```
 
@@ -33,7 +33,7 @@ select a.snapshot, n.read_at,
 from notifications n
 join activities a
   on a.id = n.activity_id
-where n.user_id = $1
+where n.auth_user_id = $1
 order by n.created_at desc,
          n.id desc
 limit 7;
@@ -57,12 +57,12 @@ The All tab, one page per query:
 ```sql
 select n.id, n.category,
        n.seen_at, n.read_at,
-       a.event_name, a.snapshot,
+       a.verb, a.snapshot,
        n.created_at
 from notifications n
 join activities a
   on a.id = n.activity_id
-where n.user_id = $1
+where n.auth_user_id = $1
   and (n.created_at, n.id)
       < ($2, $3)
 order by n.created_at desc,
@@ -94,7 +94,7 @@ select n.id, a.snapshot,
 from notifications n
 join activities a
   on a.id = n.activity_id
-where n.user_id = $1
+where n.auth_user_id = $1
   and n.action_required
   and n.read_at is null
 order by n.created_at desc,
@@ -259,7 +259,7 @@ The new `notifications` router: `list`, `unreadCount`, `markRead`,
 `markAllRead`.
 
 - Thin router: the logic lives in `@op/common`
-- Every read and write is scoped `user_id = caller` on the server
+- Every read and write is scoped `auth_user_id = caller` on the server
 - Cursor-paged `{ items, next }`, in the list index's order
 
 :::
@@ -301,67 +301,80 @@ Valentino's four cases:
 - Alice replied by updating proposal A
 - Alice submitted custom form X
 
-# One decision per field: does a feed query by it?
-
-The shipped write, `recordProposalCommentActivity.ts` in [#2708](https://github.com/oneprojectorg/common/pull/2708), split by that decision:
+# Actor, verb, object, target
 
 ::: columns
 ::: column
 
-**Yes** — a feed filters activities by it. It becomes a real,
-object-specific FK column with a `(scope, created_at desc, id desc)`
-index:
+The shipped schema, `activities.sql.ts` in [#2706](https://github.com/oneprojectorg/common/pull/2706):
+
+```ts
+idempotencyKey: uuid().notNull(),
+actorId: uuid()
+  .references(() => profiles.id, {
+    onDelete: 'set null',
+  }),
+verb: varchar().notNull(),
+objectType: varchar(),
+objectId: uuid(),    // no FK
+targetType: varchar(),
+targetId: uuid(),    // no FK
+snapshot: jsonb().notNull(),
+```
+
+:::
+::: column
+
+The shipped write, `recordProposalCommentActivity.ts` in [#2708](https://github.com/oneprojectorg/common/pull/2708):
 
 ```ts
 await db
   .insert(activities)
   .values({
-    outboxId,
-    eventName: Events
+    idempotencyKey,
+    actorId: authorProfileId,
+    verb: Events
       .proposalCommentPosted.name,
-    // process feed queries by it
-    processInstanceId:
-      proposal.processInstanceId,
-    // proposal page queries by it
-    proposalId,
-    // comment thread queries by it
-    postId,
-    // "everything Alice did"
-    actorProfileId: authorProfileId,
+    objectType: 'post',
+    objectId: postId,
+    targetType: 'proposal',
+    targetId: proposalId,
     snapshot,
   })
 ```
 
 :::
-::: column
+:::
 
-**No** — it only renders the row. It is copied into the snapshot at
-write time:
+One generic relationship to the subject and object of every event.
+The actor is always a profile — org, individual, proposal, decision
+all have profile rows — so `actor_id` keeps a real FK and sets null.
+The object and target are `(type, id)` pairs with no FK: any entity
+fits, and the `snapshot` is the record of what the objects looked
+like at that point in time, so the row renders after its object is
+renamed or deleted.
 
-```ts
-const snapshot = {
-  commenterName:
-    context.commenterName,
-  proposalTitle,
-  processName: context.processName,
-  decisionSlug: context.decisionSlug,
-  // an id, but no feed reads
-  // by it: snapshot, not FK
-  proposalProfileId:
-    context.proposalProfileId,
-  commentExcerpt:
-    context.commentContent
-      .slice(0, EXCERPT_LENGTH),
-};
+# Every feed is the same indexed read
+
+Each of actor, object, and target has a partial composite index
+`(..., created_at desc, id desc)` (no feed read ships yet):
+
+```sql
+select snapshot, created_at
+from activities
+where target_type = 'proposal'
+  and target_id = $1            -- proposal page
+--    object_type = 'post'
+--    and object_id = $1        -- one comment's activity
+--    actor_id = $1             -- everything Alice did
+order by created_at desc, id desc
+limit 20;
 ```
 
-:::
-:::
-
-The query access cases drive the schema — a new feed is what earns a
-new FK column. The snapshot exists so rendering never touches the
-domain tables: the row still reads right after the proposal is
-renamed, and after the commenter leaves (`set null`).
+A feed an event does not name has no predicate: the org feed and the
+process feed read activities only when an event names that entity as
+its target. No new column, no migration — a new entity type is just a
+new `(type, id)` value.
 
 # The four cases fit the same columns
 
@@ -407,56 +420,52 @@ reviewProposalRevisionSubmitted: {
 ```plantuml
 @startuml
 left to right direction
-rectangle "org feed" as OF
-rectangle "process feed" as PF
 rectangle "proposal page" as PR
-rectangle "comment thread" as PO
+rectangle "a comment's activity" as PO
+rectangle "everything Alice did" as AF
 database "activities" as A
-rectangle "organizations" as O
-rectangle "process_instances" as PI
-rectangle "proposals" as P
-rectangle "posts" as PS
-OF --> A : organization_id = $1
-PF --> A : process_instance_id = $1
-PR --> A : proposal_id = $1
-PO --> A : post_id = $1
-A --> O : FK, cascade
-A --> PI : FK, cascade
-A --> P : FK, cascade
-A --> PS : FK, cascade
+rectangle "profiles" as P
+PR --> A : target = ('proposal', $1)
+PO --> A : object = ('post', $1)
+AF --> A : actor_id = $1
+A --> P : actor FK, set null
 @enduml
 ```
 
-Each query-by column is a direct FK to its table.
+The actor is the one FK; every other reference is a `(type, id)`
+pair.
 
-Where each case lands when its consumer moves onto the model, like the comment one did:
+Where each case lands when its consumer moves onto the model, like
+the comment one did:
 
-| Case | Scopes | In `snapshot` |
-| --- | --- | --- |
-| merged A into B | `proposal_id` | relationship, titles |
-| revision requested | `proposal_id` | assignment, request |
-| revision submitted | `proposal_id` | history, request ids |
-| form X submitted | `organization_id` | no event yet |
+| Case | verb | object | target |
+| --- | --- | --- | --- |
+| merged A into B | `proposal/merged` | `('proposal', A)` | `('proposal', B)` |
+| revision requested | `review/revision-requested` | `('proposal', A)` | — |
+| revision submitted | `review/proposal-revision-submitted` | `('proposal', A)` | — |
+| form X submitted | no event yet | — | — |
 
 :::
 :::
 
-No case adds a column: nothing queries activities by review, merge edge, or form. An object that needs that query gets a direct FK column and its index.
+No case changes the schema: a review, a merge edge, or a form is just
+another `(type, id)` value in the same columns.
 
-# The actor / verb / object option
+# The column-per-scope option
 
 ::: columns
 ::: column
 
-Activity streams as columns — an option, not what we built:
+A direct FK column per queryable object — an option, not what we
+built:
 
 ```sql
-actor_id    uuid,
-verb        text,
-object_type text,
-object_id   uuid,  -- no FK
-target_type text,
-target_id   uuid   -- no FK
+actor_profile_id    uuid FK,
+organization_id     uuid FK,
+process_instance_id uuid FK,
+proposal_id         uuid FK,
+post_id             uuid FK
+-- every FK sets null
 ```
 
 :::
@@ -465,29 +474,60 @@ target_id   uuid   -- no FK
 What shipped in [#2706](https://github.com/oneprojectorg/common/pull/2706), `activities.sql.ts`:
 
 ```ts
-eventName: varchar(),  // verb
-actorProfileId: uuid() // actor
+actorId: uuid()
   .references(() => profiles.id,
     { onDelete: 'set null' }),
-proposalId: uuid()     // object
-  .references(() => proposals.id,
-    { onDelete: 'cascade' }),
-snapshot: jsonb().notNull(),
+verb: varchar().notNull(),
+objectType: varchar(),
+objectId: uuid(),   // no FK
+targetType: varchar(),
+targetId: uuid(),   // no FK
 ```
 
 :::
 :::
 
-The stream vocabulary is in the shipped table: `event_name` is the verb, `actor_profile_id` the actor, the scope ids and `snapshot` the object. The typed columns say what a `(type, id)` pair cannot: a deleted proposal cascades its rows; a departed actor leaves other people's feeds (`set null`).
+The FK columns say what a `(type, id)` pair cannot: the database
+checks every reference, and a deleted object sets its column null
+instead of dangling. The price: a column, an FK, an index, and a
+migration per queryable object — and the org and process feeds only
+existed because their columns did.
 
-# The trade: pay at write time, read simply
+# The trade: write generically, pay at read time
 
 No feed read ships yet; these are the shapes the two schemas force.
 
 ::: columns
 ::: column
 
-Proposal A's feed on the shipped columns — one predicate, one index:
+Proposal A's feed on the shipped pairs — one partial index per
+reference:
+
+```sql
+select a.snapshot, a.created_at
+from activities a
+where a.target_type = 'proposal'
+  and a.target_id = $1
+order by a.created_at desc,
+         a.id desc
+limit 20;
+```
+
+When a read needs the live object, the join dispatches on type:
+
+```sql
+left join proposals p
+  on a.target_type = 'proposal'
+ and p.id = a.target_id
+-- a deleted object leaves a
+-- dangling id: the snapshot
+-- still renders the row
+```
+
+:::
+::: column
+
+The same read on the column option:
 
 ```sql
 select a.snapshot, a.created_at
@@ -498,49 +538,21 @@ order by a.created_at desc,
 limit 20;
 ```
 
-When a read needs the live object, the join is typed:
-
 ```sql
-join proposals p
-  on p.id = a.proposal_id
--- a deleted proposal already
--- cascaded its rows away
-```
-
-:::
-::: column
-
-The same read on `(type, id)` — the option:
-
-```sql
-select a.snapshot, a.created_at
-from activities a
-where a.object_type = 'proposal'
-  and a.object_id = $1
--- + a partial index per type
-order by a.created_at desc,
-         a.id desc
-limit 20;
-```
-
-```sql
--- one join per type, every read
 left join proposals p
-  on a.object_type = 'proposal'
- and p.id = a.object_id
-left join posts po
-  on a.object_type = 'post'
- and po.id = a.object_id
-where p.id is not null
-   or po.id is not null
--- orphans of deleted objects,
--- filtered here, forever
+  on p.id = a.proposal_id
+-- deleted: proposal_id is null,
+-- checked by the database
 ```
 
 :::
 :::
 
-The shipped shape pays once, at write time: a column, an FK, an index, a migration per queryable object, and the consumer fills the scopes. The `(type, id)` shape inverts the trade: free writes, and every read carries the type dispatch, the per-type joins, and the orphan filtering.
+The shipped shape pays at read time: the type dispatch in every
+predicate and join, and dangling ids the database no longer checks —
+the snapshot carries the render either way. What it buys: any entity
+in two columns, no migration per new object type, and one query shape
+for every feed.
 
 
 # Appendix
@@ -550,7 +562,7 @@ The shipped shape pays once, at write time: a column, an FK, an index, a migrati
 | Table | Holds |
 | --- | --- |
 | `event_outbox` | the event, written in the domain transaction |
-| `activities` | one feed row per event, scoped by ids |
+| `activities` | one row per event: actor, verb, object, target |
 | `notifications` | one row per recipient, with read state |
 | `notification_deliveries` | one row per channel attempt |
 
@@ -561,8 +573,8 @@ Schema PR: [#2706](https://github.com/oneprojectorg/common/pull/2706) — merges
 # Idempotency, link by link
 
 - The relay sends with the outbox row id as the Inngest event id
-- `activities.outbox_id` is unique: one activity per event
-- `(activity_id, user_id)` is unique: one row per recipient
+- `activities.idempotency_key` is unique: one activity per event
+- `(activity_id, auth_user_id)` is unique: one row per recipient
 - Email sends skip notifications that already hold a delivery row
 
 A replayed event changes nothing. Delivery is at least once; storage

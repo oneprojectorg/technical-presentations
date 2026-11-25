@@ -13,7 +13,7 @@ ADR PR: [docs(adr): store notifications as outbox, activity, and per-recipient r
   - Retries
   - Activity feed record
   - No state in the inngest system, functions can crash and restart
-  - Soft At-least-once delivery; duplicates are deduped by the `outbox_id` and `(activity_id, user_id)` uniques
+  - Soft At-least-once delivery; duplicates are deduped by the `idempotency_key` and `(activity_id, auth_user_id)` uniques
 
 - We want to be able to quickly query for activity feeds
 
@@ -31,7 +31,7 @@ ADR PR: [docs(adr): store notifications as outbox, activity, and per-recipient r
 | Table Name | Holds |
 | --- | --- |
 | `event_outbox` | the event, written in the domain transaction |
-| `activities` | one feed row per event, scoped by ids |
+| `activities` | one row per event: actor, verb, object, target |
 | `notifications` | one row per recipient, with read state |
 | `notification_deliveries` | one row per channel attempt |
 
@@ -39,10 +39,10 @@ ADR PR: [docs(adr): store notifications as outbox, activity, and per-recipient r
 
 ```sql
 select n.id, n.category, n.seen_at, n.read_at,
-       a.event_name, a.snapshot, a.created_at
+       a.verb, a.snapshot, a.created_at
 from notifications n
 join activities a on a.id = n.activity_id
-where n.user_id = $1
+where n.auth_user_id = $1
   and (n.created_at, n.id) < ($2, $3)
 order by n.created_at desc, n.id desc
 limit 20;
@@ -59,10 +59,11 @@ limit 20;
 ## Feed for an organization
 
 ```sql
-select a.id, a.event_name,
-       a.actor_profile_id, a.snapshot, a.created_at
+select a.id, a.verb,
+       a.actor_id, a.snapshot, a.created_at
 from activities a
-where a.organization_id = $1
+where a.target_type = 'org'
+  and a.target_id = $1
   and (a.created_at, a.id) < ($2, $3)
 order by a.created_at desc, a.id desc
 limit 20;
@@ -79,10 +80,11 @@ limit 20;
 ## Feed for an decision process
 
 ```sql
-select a.id, a.event_name,
-       a.actor_profile_id, a.snapshot, a.created_at
+select a.id, a.verb,
+       a.actor_id, a.snapshot, a.created_at
 from activities a
-where a.process_instance_id = $1
+where a.target_type = 'decision'
+  and a.target_id = $1
   and (a.created_at, a.id) < ($2, $3)
 order by a.created_at desc, a.id desc
 limit 20;
@@ -131,15 +133,13 @@ entity "event_outbox" as outbox <<new>> {
 entity "activities" as activities <<new>> {
   * id : uuid <<PK>>
   --
-  * event_name : text
-  * outbox_id : uuid <<FK, unique>>
-  actor_profile_id : uuid <<FK>>
-  owner_profile_id : uuid <<FK>>
-  organization_id : uuid <<FK>>
-  process_instance_id : uuid <<FK>>
-  proposal_id : uuid <<FK>>
-  post_id : uuid <<FK>>
-  profile_id : uuid <<FK>>
+  * idempotency_key : uuid <<unique, no FK>>
+  actor_id : uuid <<FK, set null>>
+  * verb : text
+  object_type : text
+  object_id : uuid <<no FK>>
+  target_type : text
+  target_id : uuid <<no FK>>
   * snapshot : jsonb
   * created_at : timestamptz
 }
@@ -148,15 +148,14 @@ entity "notifications" as notifications <<new>> {
   * id : uuid <<PK>>
   --
   * activity_id : uuid <<FK>>
-  * user_id : uuid <<FK>>
-  profile_id : uuid <<FK>>
+  * auth_user_id : uuid <<FK>>
   * category : text
   * action_required : bool
   seen_at : timestamptz
   read_at : timestamptz
   * created_at : timestamptz
   --
-  unique (activity_id, user_id)
+  unique (activity_id, auth_user_id)
 }
 
 entity "notification_deliveries" as deliveries <<new>> {
@@ -176,32 +175,16 @@ entity "auth.users" as users <<existing>> {
 }
 entity "profiles" as profiles <<existing>> {
   * id : uuid <<PK>>
-}
-entity "organizations" as organizations <<existing>> {
-  * id : uuid <<PK>>
-}
-entity "process_instances" as instances <<existing>> {
-  * id : uuid <<PK>>
-}
-entity "proposals" as proposals <<existing>> {
-  * id : uuid <<PK>>
-}
-entity "posts" as posts <<existing>> {
-  * id : uuid <<PK>>
+  * entity_type : org | individual |\n    proposal | decision | phase
 }
 
 ' ── relationships ───────────────────────────
-profiles ||--o{ activities : actor / owner / subject
-organizations ||--o{ activities : org scope
-instances ||--o{ activities : context
-proposals ||--o{ activities : subject
-posts ||--o{ activities : subject
+profiles ||--o{ activities : actor (the one FK)
 
 outbox ||--o| activities : becomes
 
 activities ||--o{ notifications : fans out per recipient
 users ||--o{ notifications : receives
-profiles ||--o{ notifications : capacity
 
 notifications ||--o{ deliveries : per channel attempt
 @enduml
@@ -234,7 +217,7 @@ D --> DEL : email / SMS / WhatsApp,\none row per attempt
 @enduml
 ```
 
-- Each stage is idempotent on its own key: `outbox_id`, `(activity_id, user_id)`, the provider idempotency key
+- Each stage is idempotent on its own key: `idempotency_key`, `(activity_id, auth_user_id)`, the provider idempotency key
 - A retry at any stage re-does only that stage — it never re-fans or re-sends what already landed
 
 # Send Sequence Diagram
@@ -262,7 +245,7 @@ OB -> IG : inngest.send(id = outbox.id)
 OB -> OBX : mark sent_at
 IG -> FN : invoke (retries, debounce)
 FN -> PG : resolve recipients
-FN -> PG : insert activity (outbox_id),\nfan out notifications
+FN -> PG : insert activity (idempotency_key),\nfan out notifications
 FN -> PG : read notification_preferences\n(filter channels)
 FN -> RS : OPBatchSend (idempotency keys)
 FN -> PG : append notification_deliveries (sent)
@@ -363,18 +346,18 @@ Rel(adapters, twilio, "sms / whatsapp")
 
 # Existing events that become activities
 
-| Event | Feed scope | Recipients → category | action_required |
+| Event (the `verb`) | object → target | Recipients → category | action_required |
 | --- | --- | --- | --- |
-| `proposal/submitted` | process, org | admins → `processUpdates`, followers → `thingsYouFollow` | no |
-| `proposalComment/posted` | proposal | author + participants → `proposalsAndComments` | no |
-| `comment/posted` | post, org | post author → `proposalsAndComments` | no |
-| `post/reaction-added` | post | post author → `proposalsAndComments` | no |
-| `review/revision-requested` | proposal | author → `proposalsAndComments` | **yes** |
-| `review/proposal-revision-submitted` | proposal | reviewers → `processUpdates` | **yes** |
-| `decision/phase-transitioned` | process, org | members → `processUpdates` | no |
-| `decision/update-posted` | process, org | members → `processUpdates` | no |
-| `decision/results-notified` | process, org | members → `processUpdates` | no |
-| `proposal/merged`, `proposal/rejected` | proposal | author → `proposalsAndComments` | no |
+| `proposal/submitted` | proposal → decision | admins → `processUpdates`, followers → `thingsYouFollow` | no |
+| `proposalComment/posted` | post → proposal | author + participants → `proposalsAndComments` | no |
+| `comment/posted` | post → its root profile | post author → `proposalsAndComments` | no |
+| `post/reaction-added` | post → its root profile | post author → `proposalsAndComments` | no |
+| `review/revision-requested` | proposal → — | author → `proposalsAndComments` | **yes** |
+| `review/proposal-revision-submitted` | proposal → — | reviewers → `processUpdates` | **yes** |
+| `decision/phase-transitioned` | decision → org | members → `processUpdates` | no |
+| `decision/update-posted` | post → decision | members → `processUpdates` | no |
+| `decision/results-notified` | decision → org | members → `processUpdates` | no |
+| `proposal/merged`, `proposal/rejected` | proposal → proposal | author → `proposalsAndComments` | no |
 
 # event_outbox
 
@@ -418,7 +401,7 @@ create index on event_outbox (created_at) where sent_at is null;
 
 - Written in the **same transaction** as the domain write: rollback emits nothing
 - A relay (Inngest cron, pg_notify as optional wake-up) delivers at least once, `id` doubles as the Inngest event id
-- One sweep at a time (Inngest concurrency 1); an overlapping or crashed sweep can only re-send, never lose — the `outbox_id` unique on `activities` absorbs the duplicate
+- One sweep at a time (Inngest concurrency 1); an overlapping or crashed sweep can only re-send, never lose — the `idempotency_key` unique on `activities` absorbs the duplicate
 - Sent rows are pruned after 30 days; the partial index keeps the sweep fast regardless
 
 # event_outbox — writing with the domain model
@@ -478,85 +461,76 @@ skinparam linetype ortho
 entity "activities" as activities {
   * id : uuid <<PK>>
   --
-  * event_name : text
-  * outbox_id : uuid <<FK, unique>>
-  actor_profile_id : uuid <<FK>>
-  owner_profile_id : uuid <<FK>>
-  organization_id : uuid <<FK>>
-  process_instance_id : uuid <<FK>>
-  proposal_id : uuid <<FK>>
-  post_id : uuid <<FK>>
-  profile_id : uuid <<FK>>
+  * idempotency_key : uuid <<unique, no FK>>
+  actor_id : uuid <<FK, set null>>
+  * verb : text
+  object_type : text
+  object_id : uuid <<no FK>>
+  target_type : text
+  target_id : uuid <<no FK>>
   * snapshot : jsonb
   * created_at : timestamptz
 }
 
 entity "profiles" as profiles
-entity "organizations" as organizations
-entity "process_instances" as instances
-entity "proposals" as proposals
-entity "posts" as posts
 entity "notifications" as notifications
 
-profiles ||--o{ activities : actor / owner / subject
-organizations ||--o{ activities : org scope
-instances ||--o{ activities : context
-proposals ||--o{ activities : subject
-posts ||--o{ activities : subject
+profiles ||--o{ activities : actor (the one FK)
 activities ||--o{ notifications : fans out per recipient
 @enduml
 ```
 
 # activities — PostgreSQL
 
+What shipped in [#2706](https://github.com/oneprojectorg/common/pull/2706) (from the generated migration):
+
 ```sql
-create table activities (
-  id                   uuid primary key default gen_random_uuid(),
-  event_name           text not null,
-  outbox_id            uuid not null references event_outbox(id),  -- also the Inngest event id
-  actor_profile_id     uuid references profiles(id),
-  owner_profile_id     uuid references profiles(id),      -- denormalized owning scope
-  organization_id      uuid references organizations(id), -- denormalized org scope
-  process_instance_id  uuid references process_instances(id),
-  proposal_id          uuid references proposals(id),
-  post_id              uuid references posts(id),
-  profile_id           uuid references profiles(id),
-  snapshot             jsonb not null default '{}',
-  created_at           timestamptz not null default now(),
-  check (num_nonnulls(process_instance_id, proposal_id,
-                      post_id, profile_id) > 0)
+CREATE TABLE "activities" (
+  "id" uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  "idempotency_key" uuid NOT NULL,  -- the Inngest event id; no FK
+  "actor_id" uuid,                  -- FK profiles, set null
+  "verb" varchar(255) NOT NULL,
+  "object_type" varchar(255),
+  "object_id" uuid,                 -- no FK
+  "target_type" varchar(255),
+  "target_id" uuid,                 -- no FK
+  "snapshot" jsonb NOT NULL,
+  "created_at" timestamp with time zone
 );
 
--- one composite index per feed scope: (scope, created_at desc, id desc),
--- the same shape posts_to_organizations uses for its org feed
 -- idempotency backstop: a replayed event cannot record twice
-create unique index on activities (outbox_id);
+CREATE UNIQUE INDEX "activities_idempotency_key_idx"
+  ON "activities" ("idempotency_key");
 
-create index on activities (process_instance_id, created_at desc, id desc);
-create index on activities (owner_profile_id,    created_at desc, id desc);
-create index on activities (organization_id,     created_at desc, id desc);
-create index on activities (actor_profile_id,    created_at desc, id desc);
+-- one partial composite index per reference
+CREATE INDEX ON "activities"
+  ("object_type","object_id","created_at" DESC,"id" DESC)
+  WHERE object_id IS NOT NULL;
+CREATE INDEX ON "activities"
+  ("target_type","target_id","created_at" DESC,"id" DESC)
+  WHERE target_id IS NOT NULL;
+CREATE INDEX ON "activities"
+  ("actor_id","created_at" DESC,"id" DESC)
+  WHERE actor_id IS NOT NULL;
 ```
 
 # activities — example row
 
 ```sql
 select jsonb_pretty(to_jsonb(a)) from activities a
- where a.event_name = 'proposal/submitted' limit 1;
+ where a.verb = 'proposal/submitted' limit 1;
 ```
 
 ```json
 {
   "id": "7c9e1d2a-4f3b-4a8e-9c01-5b6d7e8f9a01",
-  "event_name": "proposal/submitted",
-  "outbox_id": "0b1c2d3e-4f5a-4b6c-8d7e-9f0a1b2c3d4e",
-  "actor_profile_id": "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d",
-  "owner_profile_id": "c0ffee00-1234-4abc-9def-567890abcdef",
-  "organization_id": "2b3c4d5e-6f70-4a81-92b3-c4d5e6f70819",
-  "process_instance_id": "9e8d7c6b-5a49-4382-b716-05f4e3d2c1b0",
-  "proposal_id": "5e4d3c2b-1a09-4f8e-7d6c-5b4a39281706",
-  "post_id": null,
-  "profile_id": null,
+  "idempotency_key": "0b1c2d3e-4f5a-4b6c-8d7e-9f0a1b2c3d4e",
+  "actor_id": "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d",
+  "verb": "proposal/submitted",
+  "object_type": "proposal",
+  "object_id": "5e4d3c2b-1a09-4f8e-7d6c-5b4a39281706",
+  "target_type": "decision",
+  "target_id": "9e8d7c6b-5a49-4382-b716-05f4e3d2c1b0",
   "snapshot": {
     "proposalName": "Shade trees for Linden",
     "processName": "Columbus Participatory Budget"
@@ -565,14 +539,14 @@ select jsonb_pretty(to_jsonb(a)) from activities a
 }
 ```
 
-- The ids place the row in every feed scope
-- `snapshot` holds only the subject names, so a feed entry survives its subject's deletion
-- The actor is never snapshotted: the feed joins `actor_profile_id` to `profiles` at read time, so a renamed profile shows its current name and avatar
+- The object and target pairs place the row in its feeds; any entity fits without a schema change
+- `snapshot` holds only the subject names, so a feed entry survives its subject's deletion — a deleted object leaves a dangling id and the row still renders
+- The actor is never snapshotted: the feed joins `actor_id` to `profiles` at read time, so a renamed profile shows its current name and avatar
 
-# Open question: deleted actors
+# Deleted actors — decided
 
-- We join the actor at read time, so a hard-deleted profile leaves the feed entry with no name
-- Decide the `on delete` rule for `actor_profile_id` and what the feed renders then — "A deleted account", or hide the row
+- `actor_id` is the table's one FK and sets `null` on delete: a departed actor does not erase events from other people's feeds
+- The feed renders a null actor as a deleted account; the object and target carry no FK, so their rows never block a delete
 
 # notifications
 
@@ -586,25 +560,22 @@ entity "notifications" as notifications {
   * id : uuid <<PK>>
   --
   * activity_id : uuid <<FK>>
-  * user_id : uuid <<FK auth.users>>
-  profile_id : uuid <<FK>>
+  * auth_user_id : uuid <<FK auth.users>>
   * category : text
   * action_required : bool
   seen_at : timestamptz
   read_at : timestamptz
   * created_at : timestamptz
   --
-  unique (activity_id, user_id)
+  unique (activity_id, auth_user_id)
 }
 
 entity "activities" as activities
 entity "auth.users" as users
-entity "profiles" as profiles
 entity "notification_deliveries" as deliveries
 
 activities ||--o{ notifications : fans out per recipient
 users ||--o{ notifications : receives
-profiles ||--o{ notifications : capacity
 notifications ||--o{ deliveries : per channel attempt
 @enduml
 ```
@@ -613,22 +584,23 @@ notifications ||--o{ deliveries : per channel attempt
 
 ```sql
 create table notifications (
-  id           uuid primary key default gen_random_uuid(),
-  activity_id  uuid not null references activities(id) on delete cascade,
-  user_id      uuid not null references auth.users(id),
-  profile_id   uuid references profiles(id),
-  category         text not null,
-  action_required  boolean not null default false,  -- stamped from event_name at fan-out
-  seen_at      timestamptz,
-  read_at      timestamptz,
-  created_at   timestamptz not null default now(),
-  unique (activity_id, user_id)
+  id            uuid primary key default gen_random_uuid(),
+  activity_id   uuid not null references activities(id) on delete cascade,
+  auth_user_id  uuid not null references auth.users(id),
+  category         varchar not null,  -- a preference category
+  action_required  boolean not null default false,  -- stamped from the verb at fan-out
+  seen_at       timestamptz,
+  read_at       timestamptz,
+  created_at    timestamptz not null default now(),
+  unique (activity_id, auth_user_id)
 );
 
-create index on notifications (user_id, created_at desc, id desc);
-create index on notifications (user_id) where read_at is null;
+create index on notifications (auth_user_id, created_at desc, id desc);
+-- the badge and the unread list
+create index on notifications (auth_user_id, created_at desc, id desc)
+  where read_at is null;
 -- the "Needs action" tab
-create index on notifications (user_id, created_at desc, id desc)
+create index on notifications (auth_user_id, created_at desc, id desc)
   where action_required and read_at is null;
 ```
 
@@ -646,8 +618,7 @@ select jsonb_pretty(to_jsonb(n)) from notifications n
 {
   "id": "11aa22bb-33cc-4dd4-8ee5-ff6677889900",
   "activity_id": "7c9e1d2a-4f3b-4a8e-9c01-5b6d7e8f9a01",
-  "user_id": "d4c3b2a1-f6e5-4b7a-9d8c-5f4e3d2c1b0a",
-  "profile_id": "c0ffee00-1234-4abc-9def-567890abcdef",
+  "auth_user_id": "d4c3b2a1-f6e5-4b7a-9d8c-5f4e3d2c1b0a",
   "category": "processUpdates",
   "action_required": false,
   "seen_at": null,
@@ -660,8 +631,7 @@ select jsonb_pretty(to_jsonb(n)) from notifications n
 {
   "id": "99ff88ee-77dd-4cc6-8bb5-aa4433221100",
   "activity_id": "7c9e1d2a-4f3b-4a8e-9c01-5b6d7e8f9a01",
-  "user_id": "e5d4c3b2-a1f0-4e9d-8c7b-6a5f4e3d2c1b",
-  "profile_id": "f0e1d2c3-b4a5-4968-8776-655443322110",
+  "auth_user_id": "e5d4c3b2-a1f0-4e9d-8c7b-6a5f4e3d2c1b",
   "category": "thingsYouFollow",
   "action_required": false,
   "seen_at": null,
@@ -720,12 +690,12 @@ create index on notification_deliveries (provider_message_id);
 ```sql
 -- the rows fanned out to you, with read state
 select n.id, n.category, n.seen_at, n.read_at,
-       a.event_name, a.snapshot, a.created_at
+       a.verb, a.snapshot, a.created_at
 from notifications n
 join activities a on a.id = n.activity_id
-where n.user_id = $1
+where n.auth_user_id = $1
   and (n.created_at, n.id) < ($2, $3)        -- cursor from the previous page
-order by n.created_at desc, n.id desc        -- walks (user_id, created_at, id)
+order by n.created_at desc, n.id desc        -- walks (auth_user_id, created_at, id)
 limit 20;
 ```
 
@@ -736,7 +706,7 @@ limit 20;
     "category": "processUpdates",
     "seen_at": null,
     "read_at": null,
-    "event_name": "proposal/submitted",
+    "verb": "proposal/submitted",
     "snapshot": {
       "proposalName": "Shade trees for Linden",
       "processName": "Columbus Participatory Budget"
@@ -748,7 +718,7 @@ limit 20;
     "category": "proposalsAndComments",
     "seen_at": "2026-11-11T09:15:00.000Z",
     "read_at": "2026-11-11T09:16:40.311Z",
-    "event_name": "post/reaction-added",
+    "verb": "post/reaction-added",
     "snapshot": {
       "postPreview": "We should plant shade trees along…"
     },
@@ -761,7 +731,7 @@ limit 20;
 
 ```sql
 select count(*) from notifications
-where user_id = $1 and read_at is null;      -- partial index
+where auth_user_id = $1 and read_at is null;  -- partial index
 ```
 
 ```json
@@ -773,10 +743,10 @@ where user_id = $1 and read_at is null;      -- partial index
 # Feed for a person — "Needs action"
 
 ```sql
-select n.id, a.event_name, a.snapshot, n.created_at
+select n.id, a.verb, a.snapshot, n.created_at
 from notifications n
 join activities a on a.id = n.activity_id
-where n.user_id = $1 and n.action_required and n.read_at is null
+where n.auth_user_id = $1 and n.action_required and n.read_at is null
 order by n.created_at desc, n.id desc
 limit 20;
 ```
@@ -785,7 +755,7 @@ limit 20;
 [
   {
     "id": "77ab88cd-99ef-4a01-8b23-c45d67e89f0a",
-    "event_name": "review/revision-requested",
+    "verb": "review/revision-requested",
     "snapshot": {
       "proposalName": "Shade trees for Linden",
       "reason": "Add a cost estimate"
@@ -801,11 +771,12 @@ limit 20;
 
 ```sql
 -- shared feed: no per-user rows, the audience is "who can see the process"
-select a.id, a.event_name, a.actor_profile_id, a.snapshot, a.created_at
+select a.id, a.verb, a.actor_id, a.snapshot, a.created_at
 from activities a
-where a.process_instance_id = $1
+where a.target_type = 'decision'
+  and a.target_id = $1
   and (a.created_at, a.id) < ($2, $3)
-order by a.created_at desc, a.id desc        -- walks (process_instance_id, …)
+order by a.created_at desc, a.id desc        -- walks (target_type, target_id, …)
 limit 20;
 ```
 
@@ -813,8 +784,8 @@ limit 20;
 [
   {
     "id": "7c9e1d2a-4f3b-4a8e-9c01-5b6d7e8f9a01",
-    "event_name": "proposal/submitted",
-    "actor_profile_id": "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d",
+    "verb": "proposal/submitted",
+    "actor_id": "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d",
     "snapshot": {
       "proposalName": "Shade trees for Linden",
       "processName": "Columbus Participatory Budget"
@@ -823,8 +794,8 @@ limit 20;
   },
   {
     "id": "3a2b1c0d-9e8f-4765-8432-10fedcba9876",
-    "event_name": "decision/joined",
-    "actor_profile_id": "f0e1d2c3-b4a5-4968-8776-655443322110",
+    "verb": "decision/joined",
+    "actor_id": "f0e1d2c3-b4a5-4968-8776-655443322110",
     "snapshot": {
       "processName": "Columbus Participatory Budget"
     },
@@ -833,18 +804,19 @@ limit 20;
 ]
 ```
 
-- The same `proposal/submitted` activity the person's feed showed — one row serves every scope
-- The reader resolves each `actor_profile_id` to the current profile name at render time
+- The same `proposal/submitted` activity the person's feed showed — one row serves every feed that reads it
+- The reader resolves each `actor_id` to the current profile name at render time
 
 # Feed for an organization
 
 ```sql
--- everything that happened under the org, across its processes and posts
-select a.id, a.event_name, a.actor_profile_id, a.snapshot, a.created_at
+-- the events that name the org as their target
+select a.id, a.verb, a.actor_id, a.snapshot, a.created_at
 from activities a
-where a.organization_id = $1
+where a.target_type = 'org'
+  and a.target_id = $1
   and (a.created_at, a.id) < ($2, $3)
-order by a.created_at desc, a.id desc        -- walks (organization_id, …)
+order by a.created_at desc, a.id desc        -- walks (target_type, target_id, …)
 limit 20;
 ```
 
@@ -852,18 +824,18 @@ limit 20;
 [
   {
     "id": "7c9e1d2a-4f3b-4a8e-9c01-5b6d7e8f9a01",
-    "event_name": "proposal/submitted",
-    "actor_profile_id": "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d",
+    "verb": "decision/phase-transitioned",
+    "actor_id": "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d",
     "snapshot": {
-      "proposalName": "Shade trees for Linden",
-      "processName": "Columbus Participatory Budget"
+      "processName": "Columbus Participatory Budget",
+      "phaseName": "Voting"
     },
     "created_at": "2026-11-12T14:03:22.418Z"
   },
   {
     "id": "8d7c6b5a-4938-4271-a605-f4e3d2c1b0a9",
-    "event_name": "post/reaction-added",
-    "actor_profile_id": "d2c3b4a5-e6f7-4089-9a1b-2c3d4e5f6071",
+    "verb": "post/reaction-added",
+    "actor_id": "d2c3b4a5-e6f7-4089-9a1b-2c3d4e5f6071",
     "snapshot": {
       "postPreview": "We should plant shade trees along…"
     },
@@ -872,7 +844,7 @@ limit 20;
 ]
 ```
 
-- The org feed mixes event types: the process rows and the post rows share one query because both carry `organization_id`
+- The org feed mixes event types: a phase transition and a reaction share one query because both name the org as their target — an event that targets something else does not appear here
 
 # New events for the activity feed
 
@@ -905,7 +877,7 @@ processJoined: {
 
 - Already covered: "liked" → `post/reaction-added`, "submitted" → `proposal/submitted`
 - These three put real events behind `thingsYouFollow`, the preference category that exists with nothing feeding it
-- `action_required` is stamped from `event_name` at fan-out: review assignments and revision requests set it, FYI events do not
+- `action_required` is stamped from the verb at fan-out: review assignments and revision requests set it, FYI events do not
 
 
 # 1. relayOutbox — serial
@@ -930,7 +902,7 @@ export const relayOutbox = inngest.createFunction(
 ```
 
 - Serial on purpose: one sweep at a time, oldest first — ordering comes free
-- A crash between send and mark re-sends; the Inngest event id and the `outbox_id` unique absorb it
+- A crash between send and mark re-sends; the Inngest event id and the `idempotency_key` unique absorb it
 
 # 2. recordActivity — the fan-out point
 
@@ -942,13 +914,13 @@ export const recordActivity = inngest.createFunction(
    { event: 'decision/joined' }],
   async ({ event, step }) => {
     const activity = await step.run('record', () =>
-      insertActivity(event));           // outbox_id unique absorbs replays
+      insertActivity(event));           // idempotency_key unique absorbs replays
 
     const recipients = await step.run('resolve', () =>
       resolveRecipients(activity));     // admins, followers, assignees
 
     const notifications = await step.run('fan-out', () =>
-      insertNotifications(activity, recipients)); // (activity_id, user_id) unique
+      insertNotifications(activity, recipients)); // (activity_id, auth_user_id) unique
 
     await step.sendEvent('deliver',
       notifications.map((n) => ({
