@@ -303,14 +303,10 @@ Valentino's four cases:
 
 # One decision per field: does a feed query by it?
 
-The shipped write, `recordProposalCommentActivity.ts` in [#2708](https://github.com/oneprojectorg/common/pull/2708), split by that decision:
-
 ::: columns
 ::: column
 
-**Yes** — a feed filters activities by it. It becomes a real,
-object-specific FK column with a `(scope, created_at desc, id desc)`
-index:
+The shipped write, `recordProposalCommentActivity.ts` in [#2708](https://github.com/oneprojectorg/common/pull/2708):
 
 ```ts
 await db
@@ -319,15 +315,14 @@ await db
     outboxId,
     eventName: Events
       .proposalCommentPosted.name,
-    // process feed queries by it
+    // feeds query by these four:
+    // each is a real FK column
+    actorProfileId: authorProfileId,
     processInstanceId:
       proposal.processInstanceId,
-    // proposal page queries by it
     proposalId,
-    // comment thread queries by it
     postId,
-    // "everything Alice did"
-    actorProfileId: authorProfileId,
+    // everything render-only:
     snapshot,
   })
 ```
@@ -335,7 +330,7 @@ await db
 :::
 ::: column
 
-**No** — it only renders the row. It is copied into the snapshot at
+The snapshot, same file — the fields no feed queries by, copied at
 write time:
 
 ```ts
@@ -345,8 +340,8 @@ const snapshot = {
   proposalTitle,
   processName: context.processName,
   decisionSlug: context.decisionSlug,
-  // an id, but no feed reads
-  // by it: snapshot, not FK
+  // an id, but nothing queries
+  // activities by it: no FK
   proposalProfileId:
     context.proposalProfileId,
   commentExcerpt:
@@ -358,10 +353,26 @@ const snapshot = {
 :::
 :::
 
+What those columns buy: every activity feed is the same one-predicate,
+index-ordered read, swapping one column (no feed read ships yet):
+
+```sql
+select snapshot, created_at
+from activities
+where proposal_id = $1            -- proposal page
+--    organization_id = $1        -- org feed
+--    process_instance_id = $1    -- process feed
+--    post_id = $1                -- comment thread
+--    actor_profile_id = $1       -- everything Alice did
+order by created_at desc, id desc
+limit 20;
+```
+
 The query access cases drive the schema — a new feed is what earns a
-new FK column. The snapshot exists so rendering never touches the
-domain tables: the row still reads right after the proposal is
-renamed, and after the commenter leaves (`set null`).
+new FK column. The snapshot is the record of what the objects looked
+like at that point in time: rendering never touches the domain
+tables, and the row still reads after the proposal is renamed or
+deleted — every FK sets null, and the snapshot carries the render.
 
 # The four cases fit the same columns
 
@@ -420,10 +431,10 @@ OF --> A : organization_id = $1
 PF --> A : process_instance_id = $1
 PR --> A : proposal_id = $1
 PO --> A : post_id = $1
-A --> O : FK, cascade
-A --> PI : FK, cascade
-A --> P : FK, cascade
-A --> PS : FK, cascade
+A --> O : FK, set null
+A --> PI : FK, set null
+A --> P : FK, set null
+A --> PS : FK, set null
 @enduml
 ```
 
@@ -471,14 +482,14 @@ actorProfileId: uuid() // actor
     { onDelete: 'set null' }),
 proposalId: uuid()     // object
   .references(() => proposals.id,
-    { onDelete: 'cascade' }),
+    { onDelete: 'set null' }),
 snapshot: jsonb().notNull(),
 ```
 
 :::
 :::
 
-The stream vocabulary is in the shipped table: `event_name` is the verb, `actor_profile_id` the actor, the scope ids and `snapshot` the object. The typed columns say what a `(type, id)` pair cannot: a deleted proposal cascades its rows; a departed actor leaves other people's feeds (`set null`).
+The stream vocabulary is in the shipped table: `event_name` is the verb, `actor_profile_id` the actor, the scope ids and `snapshot` the object. The typed columns say what a `(type, id)` pair cannot: a deleted object sets its column null and the row keeps rendering from the snapshot; a bare `(type, id)` just dangles.
 
 # The trade: pay at write time, read simply
 
@@ -501,10 +512,10 @@ limit 20;
 When a read needs the live object, the join is typed:
 
 ```sql
-join proposals p
+left join proposals p
   on p.id = a.proposal_id
--- a deleted proposal already
--- cascaded its rows away
+-- deleted: proposal_id is null,
+-- the snapshot still renders
 ```
 
 :::
@@ -531,10 +542,9 @@ left join proposals p
 left join posts po
   on a.object_type = 'post'
  and po.id = a.object_id
-where p.id is not null
-   or po.id is not null
--- orphans of deleted objects,
--- filtered here, forever
+-- a deleted object leaves a
+-- dangling id: dead and live
+-- look the same until you join
 ```
 
 :::
